@@ -1,0 +1,4 @@
+# Contengono credenziali/dominio reali dei server: non vanno versionati.
+# Template di riferimento: services/example.env
+services/*.env
+!services/example.env

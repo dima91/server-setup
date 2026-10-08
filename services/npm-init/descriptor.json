@@ -1,0 +1,63 @@
+{
+    "localCertificate": {
+        "enabled": true,
+        "provider": "letsencrypt",
+        "name": "letsencrypt-cert",
+        "domains": [
+            "${SERVER_DOMAIN}",
+            "www.${SERVER_DOMAIN}",
+            "portainer.${SERVER_DOMAIN}",
+            "www.portainer.${SERVER_DOMAIN}",
+            "webui.${SERVER_DOMAIN}",
+            "www.webui.${SERVER_DOMAIN}"
+        ],
+        "letsencrypt": {
+            "agree": true,
+            "dns_challenge": false
+        }
+    },
+    "proxyHosts": [
+        {
+            "domain_names": [
+                "portainer.${SERVER_DOMAIN}",
+                "www.portainer.${SERVER_DOMAIN}"
+            ],
+            "forward_scheme": "https",
+            "forward_host": "portainer",
+            "forward_port": 9443,
+            "certificate_id": 0,
+            "ssl_forced": true,
+            "hsts_enabled": false,
+            "hsts_subdomains": false,
+            "trust_forwarded_proto": true,
+            "http2_support": true,
+            "block_exploits": true,
+            "caching_enabled": false,
+            "allow_websocket_upgrade": true,
+            "access_list_id": 0,
+            "advanced_config": "",
+            "enabled": true
+        },
+        {
+            "domain_names": [
+                "webui.${SERVER_DOMAIN}",
+                "www.webui.${SERVER_DOMAIN}"
+            ],
+            "forward_scheme": "http",
+            "forward_host": "open-webui",
+            "forward_port": 8080,
+            "certificate_id": 0,
+            "ssl_forced": true,
+            "hsts_enabled": false,
+            "hsts_subdomains": false,
+            "trust_forwarded_proto": true,
+            "http2_support": true,
+            "block_exploits": true,
+            "caching_enabled": false,
+            "allow_websocket_upgrade": true,
+            "access_list_id": 0,
+            "advanced_config": "",
+            "enabled": true
+        }
+    ]
+}

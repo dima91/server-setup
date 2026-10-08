@@ -1,0 +1,257 @@
+services:
+
+  ### NGINX Proxy Manager
+  npm:
+    image: 'jc21/nginx-proxy-manager:latest'
+    container_name: npm
+    restart: unless-stopped
+    ports:
+      - '80:80' # Public HTTP Port
+      - '443:443' # Public HTTPS Port
+      - '81:81' # Admin Web Port
+    environment:
+      TZ: "Europe/Rome"
+      # Postgres parameters:
+      DB_POSTGRES_HOST: 'npm-db'
+      DB_POSTGRES_PORT: '5432'
+      DB_POSTGRES_USER: ${NPM_DB_USER}
+      DB_POSTGRES_PASSWORD: ${NPM_DB_PASSWORD}
+      DB_POSTGRES_NAME: 'npm'
+      # Authentication parameters
+      INITIAL_ADMIN_EMAIL: ${NPM_ADMIN_EMAIL}
+      INITIAL_ADMIN_PASSWORD: ${NPM_ADMIN_PASSWORD}
+    volumes:
+      - npm_data:/data
+      - letsencrypt:/etc/letsencrypt
+    depends_on:
+      npm-db:
+        condition: service_healthy
+    networks:
+      - proxynet
+
+  ### Postgres NPM DB
+  npm-db:
+    image: postgres:17
+    restart: always
+    container_name: npm-db
+    environment:
+      POSTGRES_USER: ${NPM_DB_USER}
+      POSTGRES_PASSWORD: ${NPM_DB_PASSWORD}
+      POSTGRES_DB: 'npm'
+    volumes:
+      - npm_postgresql:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${NPM_DB_USER} -d npm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - proxynet
+
+  ### Automatic NPM intialization
+  npm-init:
+    image: alpine:latest
+    container_name: npm-init
+    restart: "no"
+    entrypoint: >
+      /bin/sh -c "
+        apk add --no-cache curl jq bash openssl;
+        bash /npm-init/setup.sh
+      "
+    environment:
+      - NPM_ADMIN_EMAIL=${NPM_ADMIN_EMAIL}
+      - NPM_ADMIN_PASSWORD=${NPM_ADMIN_PASSWORD}
+      - SERVER_DOMAIN=${SERVER_DOMAIN}
+      - NPM_API_URL=http://npm:81/api
+      - DESCRIPTOR_FILE=/npm-init/descriptor.json
+      - NPM_CERT_PROVIDER=${NPM_CERT_PROVIDER:-letsencrypt}
+    volumes:
+      - ./npm-init:/npm-init:ro
+    depends_on:
+      npm:
+        condition: service_started
+    networks:
+      - proxynet
+
+
+
+  ### Portainer
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    command: -H unix:///var/run/docker.sock
+    restart: always
+    profiles: ["portainer"]
+    environment:
+      - PORTAINER_SETUP_TOKEN=${PORTAINER_SETUP_TOKEN}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - proxynet
+
+  ## Automatic setup for Portainer
+  portainer-init:
+    image: alpine:latest
+    container_name: portainer-init
+    restart: "no"
+    profiles: ["portainer"]
+    entrypoint: >
+      /bin/sh -c "
+        apk add --no-cache curl jq bash openssl;
+        bash /portainer-init/setup.sh
+      "
+    environment:
+      - PORTAINER_ADMIN_USERNAME=${PORTAINER_ADMIN_USERNAME}
+      - PORTAINER_ADMIN_PASSWORD=${PORTAINER_ADMIN_PASSWORD}
+      - PORTAINER_URL=http://portainer:9000
+      - PORTAINER_SETUP_TOKEN=${PORTAINER_SETUP_TOKEN}      
+    volumes:
+      - ./portainer-init:/portainer-init:ro
+    depends_on:
+      portainer:
+        condition: service_started
+    networks:
+      - proxynet
+
+
+
+  ## Personal OpenVPN server
+  vpn-personal:
+    image: dockerdima/docker-vpn:latest
+    container_name: vpn-personal
+    profiles: ["server"]
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "1195:1195/udp"
+    environment:
+      - VPN_PORT=1195
+      - VPN_SUBNET=10.0.0.0
+    volumes:
+      - ovpn_personal:/etc/openvpn
+    restart: unless-stopped
+
+
+  ### CrowdSec
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: unless-stopped
+    profiles: ["server"]
+    environment:
+      COLLECTIONS: "crowdsecurity/nginx crowdsecurity/nginx-proxy-manager"
+      GID: "1000"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - crowdsec_config:/etc/crowdsec/
+      - crowdsec_data:/var/lib/crowdsec/data/
+      - npm_data:/var/log/nginx:ro
+    networks:
+      - proxynet
+
+  ### CrowdSec Bouncer
+  cs-bouncer:
+    image: fbonalair/traefik-crowdsec-bouncer:latest
+    container_name: cs-bouncer
+    restart: unless-stopped
+    profiles: ["server"]
+    environment:
+      CROWDSEC_BOUNCER_API_KEY: ${CROWDSEC_BOUNCER_API_KEY}
+      CROWDSEC_AGENT_HOST: crowdsec:8080
+      GIN_MODE: release
+    depends_on:
+      - crowdsec
+    networks:
+      - proxynet
+
+
+
+
+  # TODO: Make me!
+  ### VPS manager bot
+
+
+
+
+  ### Ollama
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    profiles: ["ai"]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - proxynet
+
+  ### Servizio temporaneo per scaricare i modelli al boot
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    restart: "no"
+    profiles: ["ai"]
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Attendo che Ollama sia pronto...';
+        until ollama list > /dev/null 2>&1; do sleep 3; done;
+        echo 'Download llama3...';
+        ollama pull llama3;
+        echo 'Modelli scaricati con successo!'
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - proxynet
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_TAG:-main}
+    container_name: open-webui
+    restart: unless-stopped
+    profiles: ["ai"]
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
+      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
+      - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME}
+    ports:
+      - "3000:8080"
+    volumes:
+      - open_wui_data:/app/data
+    depends_on:
+      - ollama
+    networks:
+      - proxynet
+
+
+networks:
+  proxynet:
+    external: true
+
+
+volumes:
+  npm_data:
+  letsencrypt:
+  npm_postgresql:
+  portainer_data:
+  ollama_data:
+  open_wui_data:
+  ovpn_personal:
+  crowdsec_data:
+  crowdsec_config:
