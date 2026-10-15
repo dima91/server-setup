@@ -75,7 +75,7 @@ if [[ ! -d "$SETUP_DATA_FOLDER" ]]; then
 
     # Making installation folder
     mkdir $SETUP_DATA_FOLDER
-    cd "$SETUP_DATA_FOLDER"
+    cd "$SETUP_DATA_FOLDER" || exit 1
     cp -r "$SCRIPT_DIR_PATH" .
     chmod +x "./$SCRIPT_DIR_NAME/setup.sh"
     ln -s "$SETUP_DATA_FOLDER/$SCRIPT_DIR_NAME/setup.sh" "/usr/local/bin/setup.sh"
@@ -94,8 +94,9 @@ if [[ ! -f "$INFO_FILE_PATH" ]]; then
     exit 1
 fi
 
+# shellcheck source=/dev/null
 source "$INFO_FILE_PATH"
-cd "$SETUP_DATA_FOLDER/$SCRIPT_DIR_NAME"
+cd "$SETUP_DATA_FOLDER/$SCRIPT_DIR_NAME" || exit 1
 log "Setup info file found. Next stage:$NEXT_STAGE"
 log "Current user $USER"
 sleep 2
@@ -204,15 +205,17 @@ elif [[ "$NEXT_STAGE" == "3" ]] ; then
     sudo ufw allow "80"
     sudo ufw allow "443"
     sudo ufw allow "81"
-    sudo ufw allow "9443" # Portainer
     sudo ufw allow "1195" # Personal VPN
     sudo ufw allow "3000" # Open WebUI
     cp -r services "/home/$NEW_USER"
     SERVICES_D="/home/$NEW_USER/services"
-    cd "$SERVICES_D"
+    cd "$SERVICES_D" || exit 1
+    # shellcheck source=/dev/null
     source "./.env"
     npm_db_password=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
-    sed -i "s/npm_db_password/$npm_db_password/g" .env
+    # Sostituisce il segnaposto sia nella forma di example.env (change_me_npm_db_password)
+    # sia in quella nuda (npm_db_password); una password già scelta a mano resta intatta.
+    sed -i "s/^NPM_DB_PASSWORD=\(change_me_\)\{0,1\}npm_db_password/NPM_DB_PASSWORD=$npm_db_password/" .env
 
     log "Activating services.."
     docker compose up -d
@@ -257,8 +260,9 @@ elif [[ "$NEXT_STAGE" == "3" ]] ; then
             else
                 echo "CROWDSEC_BOUNCER_API_KEY=$crowdsec_bouncer_key" >> "$SERVICES_D/.env"
             fi
-            log "Restarting cs-bouncer with the new API key..."
-            docker compose restart cs-bouncer
+            log "Recreating cs-bouncer with the new API key..."
+            # "docker compose restart" non rilegge .env: il container terrebbe la vecchia chiave.
+            docker compose up -d --no-deps --force-recreate cs-bouncer
             log "CrowdSec setup complete. Verify with: docker exec crowdsec cscli bouncers list"
         fi
     fi

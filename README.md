@@ -40,6 +40,8 @@ docker compose --env-file .env.local up -d
 
 I servizi con dominio (NPM, Portainer via proxy) sono raggiungibili su `*.127.0.0.1.nip.io` (wildcard DNS pubblico che risolve a `127.0.0.1`).
 
+Attenzione: `--profile` da riga di comando **sostituisce** `COMPOSE_PROFILES` del file env. Se avvii altri profili a mano (es. `--profile server`), passa gli stessi `--profile` anche a `down`, altrimenti i servizi degli altri profili restano in esecuzione.
+
 **Server** (stack completo, certificati Let's Encrypt reali):
 
 ```bash
@@ -124,17 +126,17 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 ### Stage 3 – Servizi Docker (NPM, CrowdSec, Portainer, ecc.)
 
 - **Ferma e disabilita** Apache (se installato) per liberare le porte 80/443.
-- **Apre le porte firewall** necessarie: 80, 443, 81 (Nginx Proxy Manager UI), 9443 (Portainer), 1195 (VPN personale), 3000 (Open WebUI).
+- **Apre le porte firewall** necessarie: 80, 443, 81 (Nginx Proxy Manager UI), 1195 (VPN personale), 3000 (Open WebUI). Portainer non ha una porta propria: si raggiunge da `portainer.<dominio>` tramite NPM.
 - **Copia** la cartella `services` (con i file `docker-compose.yml` e `.env`) nella home del nuovo utente.
 - **Si posiziona** nella directory `services` e:
     - Carica le variabili d’ambiente da `.env`.
-    - Genera una password casuale per il database di NPM e la inserisce nel file `.env`.
+    - Genera una password casuale per il database di NPM e la inserisce nel file `.env` al posto del segnaposto `NPM_DB_PASSWORD=change_me_npm_db_password` (o `npm_db_password`); una password già scelta a mano non viene toccata.
 - **Avvia** tutti i container con `docker compose up -d`.
 - **Attende** 200 secondi (con log intermedi ogni 20s) per dare il tempo ai servizi di inizializzarsi.
 - **Verifica che CrowdSec sia pronto**: tenta di eseguire `cscli version` nel container `crowdsec` per un massimo di 24 tentativi.
 - **Genera la chiave API del bouncer** per CrowdSec con il comando `cscli bouncers add npm-bouncer`.
 - **Scrive la chiave** nel file `.env` (sostituendo o aggiungendo la variabile `CROWDSEC_BOUNCER_API_KEY`).
-- **Riavvia** il container `cs-bouncer` per applicare la nuova chiave.
+- **Riavvia** il container `cs-bouncer` per applicare la nuova chiave. Fino a quel momento (e se la generazione fallisce) i proxy host rispondono 403: vedi [CrowdSec e NPM](#crowdsec-e-npm).
 - **Aggiorna** il file `setup_info` con `NEXT_STAGE=4`.
 - **Riavvia** il sistema.
 
@@ -187,6 +189,15 @@ Il CNAME wildcard è **obbligatorio** per far funzionare tutti i sottodomini (Po
 2. Create NPM certificates:
     - `certbot certonly --config /etc/letsencrypt.ini --work-dir /tmp/letsencrypt-lib --logs-dir /data/logs --cert-name ${CERTIFICATE_NAME} --agree-tos --authenticator webroot -m ${ADMIN_EMAIL} --preferred-challenges http --domains ${FULL_DOMAIN} --key-type ecdsa`
 3. Add NPM hosts via NPM UI
+
+## CrowdSec e NPM
+
+Con il profilo `server` CrowdSec e il bouncer sono collegati a NPM in due punti:
+
+- **Rilevamento**: CrowdSec legge i log di NPM (`/var/log/nginx/logs/proxy-host-*.log`, volume `npm_data` in sola lettura) grazie a [`services/crowdsec/acquis.yaml`](services/crowdsec/acquis.yaml), montato in `/etc/crowdsec/acquis.yaml`. L'etichetta `type: nginx-proxy-manager` è quella su cui filtra il parser della collection.
+- **Blocco**: se `CROWDSEC_FORWARD_AUTH_URL` è valorizzata in `.env` (come in `example.env`), `npm-init` aggiunge a ogni proxy host un `auth_request` verso `cs-bouncer`: gli IP con una decisione di ban ricevono 403. Il blocco è *fail-closed*: con una chiave bouncer non valida o `cs-bouncer` fermo i proxy host rispondono 403/500. In locale (`.env.local`) la variabile è vuota e non cambia nulla.
+
+Su un server già installato prima di questa modifica: aggiungere `CROWDSEC_FORWARD_AUTH_URL` al `.env`, ricreare `crowdsec` (`docker compose up -d crowdsec`) e rilanciare `docker compose up -d npm-init`.
 
 ## Crowdsec utils
 

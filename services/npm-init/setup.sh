@@ -11,6 +11,8 @@ NPM_EMAIL="${NPM_ADMIN_EMAIL:-}"
 NPM_PASSWORD="${NPM_ADMIN_PASSWORD:-}"
 DESCRIPTOR="${DESCRIPTOR_FILE:-/services/npm-init/descriptor.json}"
 SERVER_DOMAIN="${SERVER_DOMAIN:-localhost}"
+# URL ForwardAuth del bouncer CrowdSec (vuota = nessuna protezione, es. in locale)
+CROWDSEC_FORWARD_AUTH_URL="${CROWDSEC_FORWARD_AUTH_URL:-}"
 
 log() { echo "[npm-setup] $(date '+%H:%M:%S') $*" >&2; }
 
@@ -95,7 +97,6 @@ create_letsencrypt_certificate() {
         jq -r ".[] | select(.nice_name==\"$name\") | .id // empty" | head -1) || true
     [[ -n "$existing_id" ]] && { log "Cert LE '$name' già presente (ID: $existing_id)."; CERTIFICATE_ID="$existing_id"; return 0; }
 
-    local metadata
     domains=$(jq -c '.localCertificate.domains' "$DESCRIPTOR")
     domains=$(resolve_domains "$domains")
     le_dns=$(jq -r '.localCertificate.letsencrypt.dns_challenge // false' "$DESCRIPTOR")
@@ -250,6 +251,35 @@ create_custom_certificate() {
 # SEZIONE PROXY HOSTS
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# crowdsec_auth_snippet
+#   Stampa la config nginx (da anteporre all'advanced_config di un proxy host)
+#   che chiede al bouncer CrowdSec se l'IP del client è bannato (auth_request).
+#   - il resolver di Docker (127.0.0.11) con proxy_pass su variabile fa risolvere
+#     "cs-bouncer" a runtime: se il bouncer è giù NPM parte lo stesso e le
+#     richieste falliscono (fail-closed), invece di non avviarsi con
+#     "host not found in upstream".
+#   - X-Forwarded-For viene sovrascritto con $remote_addr: il client non può
+#     spacciarsi per un altro IP.
+# -----------------------------------------------------------------------------
+crowdsec_auth_snippet() {
+    cat <<'EOF'
+# --- CrowdSec bouncer (generato da npm-init) ---
+location = /crowdsec-auth {
+    internal;
+    resolver 127.0.0.11 valid=30s;
+    set $crowdsec_forward_auth "@CROWDSEC_FORWARD_AUTH_URL@";
+    proxy_pass $crowdsec_forward_auth;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-Ip $remote_addr;
+}
+auth_request /crowdsec-auth;
+# --- fine CrowdSec ---
+EOF
+}
+
 create_proxy_host() {
     local host_json="$1"
 
@@ -277,6 +307,11 @@ create_proxy_host() {
     enabled=$(echo "$host_json"         | jq -r '.enabled // true')
     desc_cert_id=$(echo "$host_json"    | jq -r '.certificate_id // 0')
 
+    if [[ -n "$CROWDSEC_FORWARD_AUTH_URL" ]]; then
+        local crowdsec_snippet
+        crowdsec_snippet=$(crowdsec_auth_snippet)
+        advanced_config="${crowdsec_snippet//@CROWDSEC_FORWARD_AUTH_URL@/$CROWDSEC_FORWARD_AUTH_URL}"$'\n'"$advanced_config"
+    fi
 
     # certificate_id: 0 → usa quello globale; altrimenti valore esplicito
     local cert_id_to_use="$CERTIFICATE_ID"
@@ -399,9 +434,15 @@ main() {
 
     [[ -z "$NPM_EMAIL" || -z "$NPM_PASSWORD" ]] && { log "ERRORE: NPM_ADMIN_EMAIL e NPM_ADMIN_PASSWORD richieste."; exit 1; }
     [[ ! -f "$DESCRIPTOR" ]] && { log "ERRORE: $DESCRIPTOR non trovato."; exit 1; }
+    # L'URL finisce dentro una stringa nginx tra virgolette: solo caratteri sicuri.
+    if [[ -n "$CROWDSEC_FORWARD_AUTH_URL" && ! "$CROWDSEC_FORWARD_AUTH_URL" =~ ^https?://[A-Za-z0-9._:/-]+$ ]]; then
+        log "ERRORE: CROWDSEC_FORWARD_AUTH_URL non valido: $CROWDSEC_FORWARD_AUTH_URL"
+        exit 1
+    fi
+    [[ -n "$CROWDSEC_FORWARD_AUTH_URL" ]] && log "Protezione CrowdSec attiva: $CROWDSEC_FORWARD_AUTH_URL"
 
-    wait_for_npm
-    authenticate
+    wait_for_npm || exit 1
+    authenticate || exit 1
     create_certificate
 
     local hosts_count i

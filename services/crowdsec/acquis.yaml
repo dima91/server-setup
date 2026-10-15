@@ -1,0 +1,11 @@
+# Sorgenti di log lette da CrowdSec (montato in /etc/crowdsec/acquis.yaml).
+#
+# NPM scrive i log in /data/logs; il volume npm_data è montato in sola lettura
+# in /var/log/nginx, quindi qui i file stanno sotto /var/log/nginx/logs.
+# L'etichetta "type" deve essere "nginx-proxy-manager": è quella su cui filtra
+# il parser crowdsecurity/nginx-proxy-manager-logs.
+filenames:
+  - /var/log/nginx/logs/proxy-host-*.log
+  - /var/log/nginx/logs/fallback_http_*.log
+labels:
+  type: nginx-proxy-manager
