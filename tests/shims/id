@@ -1,0 +1,5 @@
+#!/bin/bash
+# id finto: se esiste $SB/behave/id lo usa (può fare "exit"), altrimenti id vero.
+# shellcheck source=/dev/null
+[[ -f "$SB/behave/id" ]] && source "$SB/behave/id"
+exec /usr/bin/id "$@"
