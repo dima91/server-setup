@@ -83,10 +83,10 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 - **Acquisisce**:
     - OLD_USER = utente che ha lanciato `sudo` (o `$USER` se non usato sudo).
     - NEW_USER, NEW_USER_PASSW, NEW_SSH_PORT dai parametri.
-    - I gruppi primari e secondari dell’utente corrente.
+    - I gruppi secondari dell’utente originale (`id -Gn <OLD_USER>`, escluso il gruppo primario, confrontato per nome intero: un gruppo `dev-ops` non viene toccato se il primario è `dev`).
 - **Chiede conferma** all’utente mostrando tutti i valori.
-- **Crea** la cartella `SETUP_DATA_FOLDER` (`/etc/server_setup`), vi copia l’intera directory contenente lo script, ne imposta i permessi e crea un symlink in `/usr/local/bin/setup.sh`.
-- **Scrive** il file `setup_info` con tutti i dati e `NEXT_STAGE=1`. Il file contiene la password in chiaro e viene riletto con `source` da root a ogni stage: i valori sono quotati (`printf %q`, nessun carattere speciale viene interpretato) e il file è leggibile solo da root (`0600`).
+- **Crea** la cartella `SETUP_DATA_FOLDER` (`/etc/server_setup`) con modo `0700` (solo root: la copia del repo può contenere `services/.env` con le credenziali e resta lì fino allo stage 4), vi copia l’intera directory contenente lo script, ne imposta i permessi e crea un symlink in `/usr/local/bin/setup.sh`. Con un numero di parametri sbagliato si ferma prima di creare qualsiasi cosa.
+- **Scrive** il file `setup_info` con tutti i dati e `NEXT_STAGE=1`. Il file contiene la password in chiaro e viene riletto con `source` da root a ogni stage: i valori sono quotati (`printf %q`, nessun carattere speciale viene interpretato) e il file è leggibile solo da root (`0600`). La scrittura è atomica (file temporaneo + `mv`): se si interrompe, il file di stato precedente resta intatto e lo stage si ferma con un errore.
 - **Riavvia** il sistema.
 
 ---
@@ -96,7 +96,7 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 - **Esegue** `apt update && apt upgrade`.
 - **Installa** i pacchetti essenziali elencati in `ESSENTIAL_PACKAGES` (strumenti come build-essential, curl, git, ufw, htop, net-tools, ecc.).
 - **Crea** il nuovo utente `NEW_USER`, gli assegna gli stessi gruppi (aggiungendo `sudo`), imposta la password e aggiunge l’alias `updg` nel file `.bash_aliases`.
-- **Crea un file di swap** eseguendo lo script `make_swap.sh` (dettagli non mostrati, presumibilmente configura un file di swap di dimensioni adeguate).
+- **Crea un file di swap** eseguendo lo script `make_swap.sh`: `/swapfile` grande quanto la RAM (anche col fallback `dd`), registrato in `/etc/fstab`. Se `/swapfile` è già attivo non fa nulla; se `fallocate`/`dd`, `mkswap` o `swapon` falliscono esce con errore, senza dichiarare lo swap pronto né scrivere in `fstab`.
 - **Aggiorna** il file `setup_info` con `NEXT_STAGE=2`.
 - **Riavvia** il sistema.
 
@@ -106,7 +106,7 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 
 - **Rimuove** completamente l’utente originale `OLD_USER` (utente di default di molte VPS, es. `debian`).
 - **Modifica la porta SSH** nel file `/etc/ssh/sshd_config` impostandola a `NEW_SSH_PORT`. Disabilita anche il login di root via SSH.
-- **Riavvia** il servizio `sshd`.
+- **Riavvia** il servizio `sshd`. Se `ssh.socket` è attivo (Ubuntu 22.10+: con l'attivazione via socket `sshd` ignora `Port` di `sshd_config`) lo disattiva e abilita `ssh`. Poi **verifica** con `ss` che `sshd` ascolti davvero sulla nuova porta: se no si ferma con un errore (`NEXT_STAGE` resta 2) *prima* di abilitare UFW e riavviare, perché UFW chiude la 22 e il server resterebbe senza nessun accesso SSH. Risolto il problema basta rilanciare `setup.sh`.
 - **Configura UFW**:
     - Abilita IPv6.
     - Imposta policy: deny in ingresso, allow in uscita.
@@ -119,7 +119,7 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
     - Installa `docker-ce`, `docker-ce-cli`, `containerd.io` e i plugin necessari.
     - Aggiunge il nuovo utente al gruppo `docker`.
 - **Aggiorna** il file `setup_info` con `NEXT_STAGE=3`.
-- **Riavvia** il sistema.
+- **Riavvia** il sistema. Prima del riavvio il log indica dove creare il `.env` dello stage 3: `/etc/server_setup/<cartella del repo>/services/.env` (da `example.env`, con `sudo`: la cartella è solo di root).
 
 ---
 
@@ -130,15 +130,16 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 - **Copia** la cartella `services` nella home del nuovo utente (se esiste già la riusa: modifica lì il `.env`) e la intesta al nuovo utente; il `.env`, con le credenziali, è `0600`.
 - **Si posiziona** nella directory `services` e:
     - Verifica che `.env` esista (altrimenti si ferma: copia `example.env` in `.env` e rilancia). Il file non viene "sourced": è la sintassi di Compose, non quella della shell.
-    - Genera una password casuale per il database di NPM e la inserisce nel file `.env` al posto del segnaposto `NPM_DB_PASSWORD=change_me_npm_db_password` (o `npm_db_password`); una password già scelta a mano non viene toccata.
+    - Verifica che nel `.env` non sia rimasto nessun valore di `example.env`: segnaposto `change_me_*`, `SERVER_DOMAIN=example.com`, email `@example.com` (Let's Encrypt le rifiuta). Se ce ne sono si ferma **prima di avviare qualsiasi cosa** e stampa i *nomi* delle variabili (mai i valori): senza questo controllo Portainer nascerebbe con una password nota, e dà accesso al socket di Docker, cioè root sull'host.
+    - Genera una password casuale per il database di NPM e la inserisce nel file `.env` al posto del segnaposto `NPM_DB_PASSWORD=change_me_npm_db_password` (o `npm_db_password`, anche tra virgolette o con spazi finali); la riga deve essere *solo* il segnaposto: una password scelta a mano, anche se inizia allo stesso modo (`npm_db_password_prod`), non viene toccata.
 - **Crea la rete docker `proxynet`** se non esiste (nel compose è `external`).
 - **Avvia** tutti i container con `docker compose up -d`. Se fallisce lo stage si ferma, senza avanzare.
-- **Attende** 200 secondi (con log intermedi ogni 20s) per dare il tempo ai servizi di inizializzarsi.
+- **Attende i container di configurazione** `npm-init` e, se il profilo `portainer` è attivo, `portainer-init` (`docker wait`, massimo 20 minuti ciascuno) e ne controlla l'esito: se uno esce con errore (certificato Let's Encrypt non ottenuto, login fallito, admin Portainer non creato) lo stage si ferma senza avanzare. Rilanciando `setup.sh`, `docker compose up -d` riavvia gli init già usciti. Niente più attesa a tempo: CrowdSec ha un controllo di prontezza suo.
 - **Se il profilo `server` è attivo** (CrowdSec tra i servizi di Compose; altrimenti salta tutto questo):
     - Attende che CrowdSec sia davvero pronto: `cscli lapi status`, fino a 24 tentativi (`cscli version` risponde subito, prima che la LAPI sia su).
     - Genera la chiave API del bouncer con `cscli bouncers add npm-bouncer` (se il bouncer esiste già da un tentativo precedente lo ricrea) e la scrive in `.env` (`CROWDSEC_BOUNCER_API_KEY`).
     - Ricrea il container `cs-bouncer` per applicare la nuova chiave e verifica che risponda `200` al ForwardAuth.
-    - Solo a questo punto imposta `CROWDSEC_FORWARD_AUTH_URL` in `.env` e ricrea `npm-init`, che attiva il controllo su tutti i proxy host. Fino ad allora i proxy host sono raggiungibili senza controllo, ma non c'è nessuna finestra in cui rispondano 403/500: vedi [CrowdSec e NPM](#crowdsec-e-npm).
+    - Solo a questo punto imposta `CROWDSEC_FORWARD_AUTH_URL` in `.env` e ricrea `npm-init`, che attiva il controllo su tutti i proxy host. Fino ad allora i proxy host sono raggiungibili senza controllo, ma non c'è nessuna finestra in cui rispondano 403/500: vedi [CrowdSec e NPM](#crowdsec-e-npm). Se `npm-init` fallisce (ad esempio nginx rifiuta il blocco), l'attivazione viene annullata: l'URL torna vuota in `.env` e `npm-init` viene rilanciato per togliere il blocco da NPM.
     - Se uno di questi passaggi fallisce lo stage si ferma con un errore **senza avanzare** (`NEXT_STAGE` resta 3): risolto il problema basta rilanciare `setup.sh`.
 - **Aggiorna** il file `setup_info` con `NEXT_STAGE=4`.
 - **Riavvia** il sistema.
@@ -152,7 +153,7 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 ### Altre funzioni di supporto
 
 - `log()`: scrive messaggi con timestamp su file `/var/log/setup.log` e su console.
-- `update_info_file()`: riscrive il file `setup_info` con i parametri attuali e il prossimo stage.
+- `update_info_file()`: riscrive il file `setup_info` con i parametri attuali e il prossimo stage (in modo atomico; se non riesce lo stage si ferma).
 
 ### Riepilogo dei risultati finali
 
@@ -161,7 +162,7 @@ Una volta completato lo script, il server avrà:
 - Un nuovo utente con permessi sudo e gruppi ereditati dall’utente originale.
 - Accesso SSH su una porta personalizzata (e root disabilitato).
 - Firewall UFW attivo con sole porte necessarie aperte (SSH, 80, 443, 1195).
-- Swap configurato.
+- Swap configurato (grande quanto la RAM).
 - Docker installato e utente aggiunto al gruppo docker.
 - Stack di servizi in esecuzione: Nginx Proxy Manager, CrowdSec, un CS bouncer per NPM, un database per NPM, probabilmente Portainer, un server VPN e Open WebUI (a giudicare dalle porte aperte).
 - Integrazione automatica tra CrowdSec e NPM tramite la chiave bouncer generata.
@@ -198,7 +199,7 @@ Il CNAME wildcard è **obbligatorio** per far funzionare tutti i sottodomini (Po
 Con il profilo `server` CrowdSec e il bouncer sono collegati a NPM in due punti:
 
 - **Rilevamento**: CrowdSec legge i log di NPM (`/var/log/nginx/logs/proxy-host-*.log`, volume `npm_data` in sola lettura) grazie a [`services/crowdsec/acquis.yaml`](services/crowdsec/acquis.yaml), montato in `/etc/crowdsec/acquis.yaml`. L'etichetta `type: nginx-proxy-manager` è quella su cui filtra il parser della collection.
-- **Blocco**: se `CROWDSEC_FORWARD_AUTH_URL` è valorizzata in `.env`, `npm-init` scrive in `/data/nginx/custom/server_proxy.conf` (volume `npm_data`, montato in lettura/scrittura in `npm-init`) un blocco con un `auth_request` verso `cs-bouncer`. NPM include quel file in **ogni** proxy host, anche quelli creati dalla UI e non presenti nel descriptor: gli IP con una decisione di ban ricevono 403. Il blocco è delimitato da marcatori e il resto del file non viene toccato; se la variabile è vuota il blocco viene rimosso.
+- **Blocco**: se `CROWDSEC_FORWARD_AUTH_URL` è valorizzata in `.env`, `npm-init` scrive in `/data/nginx/custom/server_proxy.conf` (volume `npm_data`, montato in lettura/scrittura in `npm-init`) un blocco con un `auth_request` verso `cs-bouncer`. NPM include quel file in **ogni** proxy host, anche quelli creati dalla UI e non presenti nel descriptor: gli IP con una decisione di ban ricevono 403. Il blocco è delimitato da marcatori e il resto del file non viene toccato; se la variabile è vuota il blocco viene rimosso. Le richieste `/.well-known/acme-challenge/` sono **sempre ammesse**: sono la validazione HTTP-01 di Let's Encrypt, e con il bouncer giù o la chiave non valida il rinnovo dei certificati fallirebbe in silenzio.
 
 Il blocco è *fail-closed*: con una chiave bouncer non valida, o con `cs-bouncer` fermo o assente, i proxy host rispondono 403/500. Per questo `CROWDSEC_FORWARD_AUTH_URL` in `example.env` è **vuota**: la imposta `setup.sh` (stage 3) dopo aver generato la chiave e verificato che il bouncer risponda, e solo se il profilo `server` è attivo. Se la imposti a mano, il profilo `server` deve essere attivo; se lo togli da `COMPOSE_PROFILES` svuota anche la variabile. In locale (`.env.local`) non è definita e non cambia nulla.
 
@@ -210,7 +211,21 @@ docker compose up -d                  # ricrea npm e open-webui con le porte 81 
 docker compose up -d npm-init         # riallinea gli host e scrive il blocco globale (se la variabile è già in .env)
 ```
 
+Se nginx rifiuta il blocco (tipico: un host creato dalla UI ha ancora il vecchio snippet per-host, e `location = /crowdsec-auth` risulterebbe due volte), `npm-init` esce con errore **dopo aver ripristinato** `server_proxy.conf` com'era e aver risalvato l'host perché NPM lo riattivi: il file rifiutato non resta sul volume (altrimenti ogni salvataggio successivo, anche dalla UI, darebbe errore). Per risolvere togli l'`advanced_config` con il vecchio snippet da quell'host e rilancia `docker compose up -d npm-init`. Se un file rifiutato è già rimasto sul volume (versioni precedenti), svuota `CROWDSEC_FORWARD_AUTH_URL` e rilancia `npm-init` per rimuovere il blocco.
+
 `npm-init` prima allinea gli host del descriptor (l'`advanced_config` del vecchio snippet per-host sparisce) e solo dopo scrive il blocco globale, poi fa ricaricare nginx. Se `CROWDSEC_FORWARD_AUTH_URL` non è ancora in `.env`, aggiungi `CROWDSEC_FORWARD_AUTH_URL=http://cs-bouncer:8080/api/v1/forwardAuth` solo dopo aver verificato che il bouncer risponda: `docker exec npm curl -s -o /dev/null -w '%{http_code}' http://cs-bouncer:8080/api/v1/forwardAuth` deve stampare `200` (403 = chiave non valida).
+
+## Test
+
+I test sono in `tests/` e non toccano il sistema: `setup.sh` gira in una sandbox con i percorsi di sistema riscritti e `sudo`, `apt`, `ufw`, `systemctl`, `docker`, `reboot`... sostituiti da shim che registrano le chiamate; `npm-init` gira contro un NPM finto (`tests/mock_npm.py`); la parte ACME usa un nginx vero in Docker.
+
+```bash
+tests/run.sh                     # tutti
+tests/run.sh t_stage3 t_swap     # solo alcuni
+SS_ROOT=/percorso/di/un/albero tests/run.sh   # prova un altro albero (es. un vecchio commit estratto con git archive)
+```
+
+Servono `bash`, `jq`, `curl`, `python3`; `t_nginx_acme` usa Docker e salta se manca l'immagine `nginx:1.27-alpine`. Non sostituiscono la prova sullo stack vero (vedi la skill `verify`): lo stage 3 e `sshd` reali non si possono eseguire in sandbox.
 
 ## Crowdsec utils
 
