@@ -1,0 +1,52 @@
+#!/bin/bash
+# docker finto per lo stage 3 di setup.sh. Registra ogni chiamata in $SB/calls.log
+# (come "docker ...") e risponde in base a variabili/file di stato:
+#   FAKE_SERVICES   servizi attivi (default: stack completo con profilo server)
+#   FAKE_UP_RC      codice di "docker compose up -d" (default 0)
+#   FAKE_LAPI_READY_AFTER  quanti "cscli lapi status" falliscono prima di riuscire (default 0; 999 = mai)
+#   FAKE_FWD_CODE   codice HTTP della sonda forwardAuth (default 200)
+#   $SB/state/wait_<nome>  coda di codici di uscita per "docker wait <nome>" (uno per riga, default 0)
+printf 'docker %s\n' "$*" >> "$SB/calls.log"
+
+pop_wait() {   # stampa e consuma il primo codice della coda, 0 se vuota
+    local f="$SB/state/wait_$1" rc
+    if [[ -s "$f" ]]; then rc=$(head -1 "$f"); sed -i 1d "$f"; echo "$rc"; else echo 0; fi
+}
+
+case "$1" in
+    network)
+        [[ "$2" == "inspect" ]] && exit "${FAKE_NETWORK_RC:-0}"
+        exit 0 ;;
+    compose)
+        shift
+        case "$*" in
+            "config --services")
+                tr ' ' '\n' <<< "${FAKE_SERVICES:-npm npm-db npm-init portainer portainer-init vpn-personal crowdsec cs-bouncer}"
+                exit 0 ;;
+            "up -d")
+                exit "${FAKE_UP_RC:-0}" ;;
+            "up -d --no-deps --force-recreate "*)
+                printf 'RECREATE %s env: %s | %s\n' "${@: -1}" \
+                    "$(grep -m1 '^CROWDSEC_FORWARD_AUTH_URL=' .env)" "$(grep -m1 '^CROWDSEC_BOUNCER_API_KEY=' .env)" >> "$SB/calls.log"
+                exit "${FAKE_RECREATE_RC:-0}" ;;
+        esac
+        exit 0 ;;
+    exec)
+        shift
+        case "$*" in
+            "crowdsec cscli lapi status")
+                n=$(cat "$SB/state/lapi_calls" 2> /dev/null || echo 0)
+                echo $((n + 1)) > "$SB/state/lapi_calls"
+                [[ $n -ge ${FAKE_LAPI_READY_AFTER:-0} ]] && exit 0
+                exit 1 ;;
+            "crowdsec cscli bouncers delete"*) exit 0 ;;
+            "crowdsec cscli bouncers add"*) echo "FAKEBOUNCERKEY1234567890"; exit 0 ;;
+            "npm curl"*) echo "${FAKE_FWD_CODE:-200}"; exit 0 ;;
+        esac
+        exit 0 ;;
+    wait)
+        pop_wait "$2"
+        exit 0 ;;
+    logs) exit 0 ;;
+esac
+exit 0

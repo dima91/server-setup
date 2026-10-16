@@ -13,16 +13,17 @@ log() { echo "[portainer-setup] $(date '+%H:%M:%S') $*" >&2; }
 # -----------------------------------------------------------------------------
 wait_for_portainer() {
     log "Attendo Portainer API: $PORTAINER_URL ..."
-    local max=60 count=0
+    local max=60 count=0 code="000"
     while (( count < max )); do
-        local code
         code=$(curl -s -o /dev/null -w '%{http_code}' \
             "$PORTAINER_URL/api/system/status" 2>/dev/null || echo "000")
         [[ "$code" == "200" ]] && { log "Portainer API pronta!"; return 0; }
         (( ++count ))
         sleep 3
     done
-    log "ERRORE: Portainer non raggiungibile dopo ${max} tentativi"
+    log "ERRORE: Portainer non raggiungibile dopo ${max} tentativi (ultimo HTTP: $code)"
+    # Senza admin entro 5 minuti Portainer si blocca per sicurezza e risponde 303.
+    [[ "$code" == "303" ]] && log "Portainer è bloccato per timeout di sicurezza: riavvia il container 'portainer' e rilancia portainer-init."
     return 1
 }
 
@@ -43,20 +44,19 @@ check_if_initialized() {
 # -----------------------------------------------------------------------------
 initialize_admin() {
     log "Creazione admin user (username: $ADMIN_USERNAME)..."
-    local resp
-    
-    if [[ -n "$SETUP_TOKEN" ]]; then
-        # Portainer moderno: richiede X-Setup-Token
-        resp=$(curl -s -X POST "$PORTAINER_URL/api/users/admin/init" \
-            -H "Content-Type: application/json" \
-            -H "X-Setup-Token: $SETUP_TOKEN" \
-            -d "{\"Username\":\"$ADMIN_USERNAME\",\"Password\":\"$ADMIN_PASSWORD\"}")
-    else
-        # Portainer legacy: senza token
-        resp=$(curl -s -X POST "$PORTAINER_URL/api/users/admin/init" \
-            -H "Content-Type: application/json" \
-            -d "{\"Username\":\"$ADMIN_USERNAME\",\"Password\":\"$ADMIN_PASSWORD\"}")
-    fi
+    local resp body
+    local -a token_header=()
+
+    # Il corpo è costruito con jq: virgolette e backslash nella password vanno escapati.
+    body=$(jq -n --arg username "$ADMIN_USERNAME" --arg password "$ADMIN_PASSWORD" '{Username:$username, Password:$password}')
+
+    # Portainer moderno: richiede X-Setup-Token; legacy: senza token
+    [[ -n "$SETUP_TOKEN" ]] && token_header=(-H "X-Setup-Token: $SETUP_TOKEN")
+
+    resp=$(curl -s -X POST "$PORTAINER_URL/api/users/admin/init" \
+        -H "Content-Type: application/json" \
+        "${token_header[@]}" \
+        -d "$body")
 
     if echo "$resp" | jq -e '.Id' > /dev/null 2>&1; then
         log "Admin user creato con successo! (ID: $(echo "$resp" | jq -r '.Id'))"

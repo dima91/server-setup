@@ -8,7 +8,9 @@ services:
     ports:
       - '80:80' # Public HTTP Port
       - '443:443' # Public HTTPS Port
-      - '81:81' # Admin Web Port
+      # Admin Web Port: solo da localhost (sul server via tunnel SSH: ssh -L 8081:127.0.0.1:81).
+      # Pubblicata su tutte le interfacce aggirerebbe TLS e il controllo CrowdSec dei proxy host.
+      - '127.0.0.1:81:81'
     environment:
       TZ: "Europe/Rome"
       # Postgres parameters:
@@ -56,7 +58,8 @@ services:
     restart: "no"
     entrypoint: >
       /bin/sh -c "
-        apk add --no-cache curl jq bash openssl;
+        for i in 1 2 3 4 5 6 7 8 9 10; do apk add --no-cache curl jq bash openssl && break; echo 'apk add fallito, riprovo tra 3s...'; sleep 3; done;
+        command -v bash > /dev/null || { echo 'ERRORE: impossibile installare i pacchetti (rete?)'; exit 1; };
         bash /npm-init/setup.sh
       "
     environment:
@@ -66,8 +69,11 @@ services:
       - NPM_API_URL=http://npm:81/api
       - DESCRIPTOR_FILE=/npm-init/descriptor.json
       - NPM_CERT_PROVIDER=${NPM_CERT_PROVIDER:-letsencrypt}
+      - CROWDSEC_FORWARD_AUTH_URL=${CROWDSEC_FORWARD_AUTH_URL:-}
     volumes:
       - ./npm-init:/npm-init:ro
+      # Scrive il blocco CrowdSec in /data/nginx/custom/server_proxy.conf (incluso da NPM in ogni proxy host)
+      - npm_data:/npm-data
     depends_on:
       npm:
         condition: service_started
@@ -99,7 +105,8 @@ services:
     profiles: ["portainer"]
     entrypoint: >
       /bin/sh -c "
-        apk add --no-cache curl jq bash openssl;
+        for i in 1 2 3 4 5 6 7 8 9 10; do apk add --no-cache curl jq bash openssl && break; echo 'apk add fallito, riprovo tra 3s...'; sleep 3; done;
+        command -v bash > /dev/null || { echo 'ERRORE: impossibile installare i pacchetti (rete?)'; exit 1; };
         bash /portainer-init/setup.sh
       "
     environment:
@@ -119,7 +126,7 @@ services:
 
   ## Personal OpenVPN server
   vpn-personal:
-    image: dockerdima/docker-vpn:latest
+    image: dockerdima/docker-vpn:1.0.1
     container_name: vpn-personal
     profiles: ["server"]
     cap_add:
@@ -151,6 +158,7 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - crowdsec_config:/etc/crowdsec/
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
       - crowdsec_data:/var/lib/crowdsec/data/
       - npm_data:/var/log/nginx:ro
     networks:
@@ -230,8 +238,9 @@ services:
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
       - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME}
+    # Pubblico solo via NPM (webui.<dominio>, con TLS e CrowdSec); la porta diretta è solo da localhost (sul server via tunnel SSH: ssh -L 8081:127.0.0.1:3000).
     ports:
-      - "3000:8080"
+      - "127.0.0.1:3000:8080"
     volumes:
       - open_wui_data:/app/data
     depends_on:
