@@ -1,0 +1,6 @@
+#!/bin/bash
+# ss finto: comportamento in $SB/behave/ss (di default non vede nessuna porta in ascolto).
+printf 'ss %s\n' "$*" >> "$SB/calls.log"
+# shellcheck source=/dev/null
+[[ -f "$SB/behave/ss" ]] && source "$SB/behave/ss"
+exit 0

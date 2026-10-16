@@ -1,0 +1,8 @@
+#!/bin/bash
+# Shim generico: registra la chiamata; un eventuale comportamento si mette in
+# $SB/behave/<comando> (snippet di shell che può stampare o fare "exit N").
+name=$(basename "$0")
+printf '%s %s\n' "$name" "$*" >> "$SB/calls.log"
+# shellcheck source=/dev/null
+[[ -f "$SB/behave/$name" ]] && source "$SB/behave/$name"
+exit 0

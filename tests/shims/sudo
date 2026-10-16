@@ -1,0 +1,4 @@
+#!/bin/bash
+# sudo finto: esegue il comando (che nella sandbox è quasi sempre uno shim).
+while [[ "$1" == -* ]]; do shift; done
+exec "$@"
