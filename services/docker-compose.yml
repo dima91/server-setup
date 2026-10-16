@@ -8,7 +8,9 @@ services:
     ports:
       - '80:80' # Public HTTP Port
       - '443:443' # Public HTTPS Port
-      - '81:81' # Admin Web Port
+      # Admin Web Port: solo da localhost (sul server via tunnel SSH: ssh -L 8081:127.0.0.1:81).
+      # Pubblicata su tutte le interfacce aggirerebbe TLS e il controllo CrowdSec dei proxy host.
+      - '127.0.0.1:81:81'
     environment:
       TZ: "Europe/Rome"
       # Postgres parameters:
@@ -70,6 +72,8 @@ services:
       - CROWDSEC_FORWARD_AUTH_URL=${CROWDSEC_FORWARD_AUTH_URL:-}
     volumes:
       - ./npm-init:/npm-init:ro
+      # Scrive il blocco CrowdSec in /data/nginx/custom/server_proxy.conf (incluso da NPM in ogni proxy host)
+      - npm_data:/npm-data
     depends_on:
       npm:
         condition: service_started
@@ -234,8 +238,9 @@ services:
       - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
       - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
       - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME}
+    # Pubblico solo via NPM (webui.<dominio>, con TLS e CrowdSec); la porta diretta è solo da localhost (sul server via tunnel SSH: ssh -L 8081:127.0.0.1:3000).
     ports:
-      - "3000:8080"
+      - "127.0.0.1:3000:8080"
     volumes:
       - open_wui_data:/app/data
     depends_on:

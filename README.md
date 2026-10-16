@@ -86,7 +86,7 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
     - I gruppi primari e secondari dell’utente corrente.
 - **Chiede conferma** all’utente mostrando tutti i valori.
 - **Crea** la cartella `SETUP_DATA_FOLDER` (`/etc/server_setup`), vi copia l’intera directory contenente lo script, ne imposta i permessi e crea un symlink in `/usr/local/bin/setup.sh`.
-- **Scrive** il file `setup_info` con tutti i dati e `NEXT_STAGE=1`.
+- **Scrive** il file `setup_info` con tutti i dati e `NEXT_STAGE=1`. Il file contiene la password in chiaro e viene riletto con `source` da root a ogni stage: i valori sono quotati (`printf %q`, nessun carattere speciale viene interpretato) e il file è leggibile solo da root (`0600`).
 - **Riavvia** il sistema.
 
 ---
@@ -111,10 +111,10 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
     - Abilita IPv6.
     - Imposta policy: deny in ingresso, allow in uscita.
     - Apre la nuova porta SSH.
-    - Abilita e ricarica UFW.
+    - Attiva UFW (`ufw enable`: `systemctl enable` da solo non basta, `/etc/ufw/ufw.conf` parte con `ENABLED=no`) e lo abilita all'avvio. La sessione SSH in corso non cade: la porta è già aperta.
 - **Installa Docker**:
     - Rileva la distribuzione (Debian/Ubuntu) tramite `hostnamectl`.
-    - Rimuove eventuali vecchi pacchetti Docker.
+    - Rimuove gli eventuali vecchi pacchetti Docker/containerd/runc in conflitto (solo quelli installati, senza conferma interattiva).
     - Aggiunge la repository ufficiale Docker.
     - Installa `docker-ce`, `docker-ce-cli`, `containerd.io` e i plugin necessari.
     - Aggiunge il nuovo utente al gruppo `docker`.
@@ -126,17 +126,20 @@ Il file `setup.sh` è uno script Bash pensato per automatizzare la configurazion
 ### Stage 3 – Servizi Docker (NPM, CrowdSec, Portainer, ecc.)
 
 - **Ferma e disabilita** Apache (se installato) per liberare le porte 80/443.
-- **Apre le porte firewall** necessarie: 80, 443, 81 (Nginx Proxy Manager UI), 1195 (VPN personale), 3000 (Open WebUI). Portainer non ha una porta propria: si raggiunge da `portainer.<dominio>` tramite NPM.
-- **Copia** la cartella `services` (con i file `docker-compose.yml` e `.env`) nella home del nuovo utente.
+- **Apre le porte firewall** necessarie: 80, 443, 1195 (VPN personale). Portainer non ha una porta propria: si raggiunge da `portainer.<dominio>` tramite NPM. L'admin di NPM (81) e Open WebUI (3000) sono pubblicate **solo su localhost**: da fuori Open WebUI si raggiunge da `webui.<dominio>` (con TLS e controllo CrowdSec), l'admin di NPM con un tunnel SSH (`ssh -L 8081:127.0.0.1:81 -p <porta> <utente>@<server>`, poi `http://127.0.0.1:8081`).
+- **Copia** la cartella `services` nella home del nuovo utente (se esiste già la riusa: modifica lì il `.env`) e la intesta al nuovo utente; il `.env`, con le credenziali, è `0600`.
 - **Si posiziona** nella directory `services` e:
-    - Carica le variabili d’ambiente da `.env`.
+    - Verifica che `.env` esista (altrimenti si ferma: copia `example.env` in `.env` e rilancia). Il file non viene "sourced": è la sintassi di Compose, non quella della shell.
     - Genera una password casuale per il database di NPM e la inserisce nel file `.env` al posto del segnaposto `NPM_DB_PASSWORD=change_me_npm_db_password` (o `npm_db_password`); una password già scelta a mano non viene toccata.
-- **Avvia** tutti i container con `docker compose up -d`.
+- **Crea la rete docker `proxynet`** se non esiste (nel compose è `external`).
+- **Avvia** tutti i container con `docker compose up -d`. Se fallisce lo stage si ferma, senza avanzare.
 - **Attende** 200 secondi (con log intermedi ogni 20s) per dare il tempo ai servizi di inizializzarsi.
-- **Verifica che CrowdSec sia pronto**: tenta di eseguire `cscli version` nel container `crowdsec` per un massimo di 24 tentativi.
-- **Genera la chiave API del bouncer** per CrowdSec con il comando `cscli bouncers add npm-bouncer`.
-- **Scrive la chiave** nel file `.env` (sostituendo o aggiungendo la variabile `CROWDSEC_BOUNCER_API_KEY`).
-- **Riavvia** il container `cs-bouncer` per applicare la nuova chiave. Fino a quel momento (e se la generazione fallisce) i proxy host rispondono 403: vedi [CrowdSec e NPM](#crowdsec-e-npm).
+- **Se il profilo `server` è attivo** (CrowdSec tra i servizi di Compose; altrimenti salta tutto questo):
+    - Attende che CrowdSec sia davvero pronto: `cscli lapi status`, fino a 24 tentativi (`cscli version` risponde subito, prima che la LAPI sia su).
+    - Genera la chiave API del bouncer con `cscli bouncers add npm-bouncer` (se il bouncer esiste già da un tentativo precedente lo ricrea) e la scrive in `.env` (`CROWDSEC_BOUNCER_API_KEY`).
+    - Ricrea il container `cs-bouncer` per applicare la nuova chiave e verifica che risponda `200` al ForwardAuth.
+    - Solo a questo punto imposta `CROWDSEC_FORWARD_AUTH_URL` in `.env` e ricrea `npm-init`, che attiva il controllo su tutti i proxy host. Fino ad allora i proxy host sono raggiungibili senza controllo, ma non c'è nessuna finestra in cui rispondano 403/500: vedi [CrowdSec e NPM](#crowdsec-e-npm).
+    - Se uno di questi passaggi fallisce lo stage si ferma con un errore **senza avanzare** (`NEXT_STAGE` resta 3): risolto il problema basta rilanciare `setup.sh`.
 - **Aggiorna** il file `setup_info` con `NEXT_STAGE=4`.
 - **Riavvia** il sistema.
 
@@ -157,7 +160,7 @@ Una volta completato lo script, il server avrà:
 
 - Un nuovo utente con permessi sudo e gruppi ereditati dall’utente originale.
 - Accesso SSH su una porta personalizzata (e root disabilitato).
-- Firewall UFW attivo con sole porte necessarie aperte.
+- Firewall UFW attivo con sole porte necessarie aperte (SSH, 80, 443, 1195).
 - Swap configurato.
 - Docker installato e utente aggiunto al gruppo docker.
 - Stack di servizi in esecuzione: Nginx Proxy Manager, CrowdSec, un CS bouncer per NPM, un database per NPM, probabilmente Portainer, un server VPN e Open WebUI (a giudicare dalle porte aperte).
@@ -195,9 +198,19 @@ Il CNAME wildcard è **obbligatorio** per far funzionare tutti i sottodomini (Po
 Con il profilo `server` CrowdSec e il bouncer sono collegati a NPM in due punti:
 
 - **Rilevamento**: CrowdSec legge i log di NPM (`/var/log/nginx/logs/proxy-host-*.log`, volume `npm_data` in sola lettura) grazie a [`services/crowdsec/acquis.yaml`](services/crowdsec/acquis.yaml), montato in `/etc/crowdsec/acquis.yaml`. L'etichetta `type: nginx-proxy-manager` è quella su cui filtra il parser della collection.
-- **Blocco**: se `CROWDSEC_FORWARD_AUTH_URL` è valorizzata in `.env` (come in `example.env`), `npm-init` aggiunge a ogni proxy host un `auth_request` verso `cs-bouncer`: gli IP con una decisione di ban ricevono 403. Il blocco è *fail-closed*: con una chiave bouncer non valida o `cs-bouncer` fermo i proxy host rispondono 403/500. In locale (`.env.local`) la variabile è vuota e non cambia nulla.
+- **Blocco**: se `CROWDSEC_FORWARD_AUTH_URL` è valorizzata in `.env`, `npm-init` scrive in `/data/nginx/custom/server_proxy.conf` (volume `npm_data`, montato in lettura/scrittura in `npm-init`) un blocco con un `auth_request` verso `cs-bouncer`. NPM include quel file in **ogni** proxy host, anche quelli creati dalla UI e non presenti nel descriptor: gli IP con una decisione di ban ricevono 403. Il blocco è delimitato da marcatori e il resto del file non viene toccato; se la variabile è vuota il blocco viene rimosso.
 
-Su un server già installato prima di questa modifica: aggiungere `CROWDSEC_FORWARD_AUTH_URL` al `.env`, ricreare `crowdsec` (`docker compose up -d crowdsec`) e rilanciare `docker compose up -d npm-init`.
+Il blocco è *fail-closed*: con una chiave bouncer non valida, o con `cs-bouncer` fermo o assente, i proxy host rispondono 403/500. Per questo `CROWDSEC_FORWARD_AUTH_URL` in `example.env` è **vuota**: la imposta `setup.sh` (stage 3) dopo aver generato la chiave e verificato che il bouncer risponda, e solo se il profilo `server` è attivo. Se la imposti a mano, il profilo `server` deve essere attivo; se lo togli da `COMPOSE_PROFILES` svuota anche la variabile. In locale (`.env.local`) non è definita e non cambia nulla.
+
+Su un server già installato prima di questa modifica, dopo aver aggiornato il repo:
+
+```bash
+cd services
+docker compose up -d                  # ricrea npm e open-webui con le porte 81 e 3000 solo su localhost, e npm-init con il nuovo volume
+docker compose up -d npm-init         # riallinea gli host e scrive il blocco globale (se la variabile è già in .env)
+```
+
+`npm-init` prima allinea gli host del descriptor (l'`advanced_config` del vecchio snippet per-host sparisce) e solo dopo scrive il blocco globale, poi fa ricaricare nginx. Se `CROWDSEC_FORWARD_AUTH_URL` non è ancora in `.env`, aggiungi `CROWDSEC_FORWARD_AUTH_URL=http://cs-bouncer:8080/api/v1/forwardAuth` solo dopo aver verificato che il bouncer risponda: `docker exec npm curl -s -o /dev/null -w '%{http_code}' http://cs-bouncer:8080/api/v1/forwardAuth` deve stampare `200` (403 = chiave non valida).
 
 ## Crowdsec utils
 

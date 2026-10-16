@@ -44,20 +44,19 @@ check_if_initialized() {
 # -----------------------------------------------------------------------------
 initialize_admin() {
     log "Creazione admin user (username: $ADMIN_USERNAME)..."
-    local resp
-    
-    if [[ -n "$SETUP_TOKEN" ]]; then
-        # Portainer moderno: richiede X-Setup-Token
-        resp=$(curl -s -X POST "$PORTAINER_URL/api/users/admin/init" \
-            -H "Content-Type: application/json" \
-            -H "X-Setup-Token: $SETUP_TOKEN" \
-            -d "{\"Username\":\"$ADMIN_USERNAME\",\"Password\":\"$ADMIN_PASSWORD\"}")
-    else
-        # Portainer legacy: senza token
-        resp=$(curl -s -X POST "$PORTAINER_URL/api/users/admin/init" \
-            -H "Content-Type: application/json" \
-            -d "{\"Username\":\"$ADMIN_USERNAME\",\"Password\":\"$ADMIN_PASSWORD\"}")
-    fi
+    local resp body
+    local -a token_header=()
+
+    # Il corpo è costruito con jq: virgolette e backslash nella password vanno escapati.
+    body=$(jq -n --arg username "$ADMIN_USERNAME" --arg password "$ADMIN_PASSWORD" '{Username:$username, Password:$password}')
+
+    # Portainer moderno: richiede X-Setup-Token; legacy: senza token
+    [[ -n "$SETUP_TOKEN" ]] && token_header=(-H "X-Setup-Token: $SETUP_TOKEN")
+
+    resp=$(curl -s -X POST "$PORTAINER_URL/api/users/admin/init" \
+        -H "Content-Type: application/json" \
+        "${token_header[@]}" \
+        -d "$body")
 
     if echo "$resp" | jq -e '.Id' > /dev/null 2>&1; then
         log "Admin user creato con successo! (ID: $(echo "$resp" | jq -r '.Id'))"

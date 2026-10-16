@@ -18,6 +18,8 @@ fi
 SETUP_DATA_FOLDER="/etc/server_setup"
 INFO_FILE_PATH="$SETUP_DATA_FOLDER/setup_info"
 ESSENTIAL_PACKAGES="build-essential htop curl git-all apt-show-versions libapt-pkg-perl libauthen-pam-perl libio-pty-perl ufw lshw net-tools rsync cron"
+# Endpoint ForwardAuth di cs-bouncer, raggiungibile dalla rete docker proxynet
+CROWDSEC_FORWARD_AUTH_URL="http://cs-bouncer:8080/api/v1/forwardAuth"
 
 update_info_file()
 {
@@ -26,16 +28,112 @@ update_info_file()
         return
     fi
 
+    # Il file viene letto con "source" da root a ogni stage e contiene la password
+    # in chiaro: i valori sono quotati con %q (niente espansioni né comandi eseguiti)
+    # e il file è leggibile solo dal proprietario.
     rm -f "$INFO_FILE_PATH"
-    touch "$INFO_FILE_PATH"
-    echo "OLD_USER=$1" >> "$INFO_FILE_PATH"
-    echo "NEW_USER=$2" >> "$INFO_FILE_PATH"
-    echo "NEW_USER_PASSW=$3" >> "$INFO_FILE_PATH"
-    echo "NEW_SSH_PORT=$4" >> "$INFO_FILE_PATH"
-    echo "NEW_USER_GROUPS=$5" >> "$INFO_FILE_PATH"
-    echo "SETUP_DATA_FOLDER=$6" >> "$INFO_FILE_PATH"
-    echo "SCRIPT_DIR_NAME=$7" >> "$INFO_FILE_PATH"
-    echo "NEXT_STAGE=$8" >> "$INFO_FILE_PATH"
+    (
+        umask 077
+        {
+            printf 'OLD_USER=%q\n' "$1"
+            printf 'NEW_USER=%q\n' "$2"
+            printf 'NEW_USER_PASSW=%q\n' "$3"
+            printf 'NEW_SSH_PORT=%q\n' "$4"
+            printf 'NEW_USER_GROUPS=%q\n' "$5"
+            printf 'SETUP_DATA_FOLDER=%q\n' "$6"
+            printf 'SCRIPT_DIR_NAME=%q\n' "$7"
+            printf 'NEXT_STAGE=%q\n' "$8"
+        } > "$INFO_FILE_PATH"
+    )
+}
+
+# Imposta KEY=valore in un file env di compose: sostituisce la riga se c'è, altrimenti
+# la aggiunge. Il file viene riscritto sul posto (proprietario e permessi restano).
+set_env_var()
+{
+    local file="$1" key="$2" value="$3" tmp
+    tmp=$(mktemp) || return 1
+    KEY="$key" VAL="$value" awk 'BEGIN { FS = "="; k = ENVIRON["KEY"]; v = ENVIRON["VAL"] }
+        $1 == k { print k "=" v; found = 1; next }
+        { print }
+        END { if (!found) print k "=" v }' "$file" > "$tmp" && cat "$tmp" > "$file"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+# Genera la chiave del bouncer CrowdSec, la scrive nel .env ($1) e verifica che
+# cs-bouncer la accetti. Ritorna 1 al primo problema: lo stage non deve andare avanti
+# con proxy host che rispondono 403/500 (l'auth_request verso il bouncer è fail-closed).
+setup_crowdsec_bouncer()
+{
+    local env_file="$1" crowdsec_ready=0 bouncer_key code i
+
+    # "cscli version" risponde appena il container è su senza contattare la LAPI:
+    # "lapi status" invece riesce solo quando CrowdSec è davvero pronto.
+    log "Waiting for CrowdSec to be ready..."
+    for i in $(seq 1 24); do
+        if docker exec crowdsec cscli lapi status > /dev/null 2>&1; then
+            crowdsec_ready=1
+            break
+        fi
+        log "CrowdSec not ready yet, retrying in 5s... ($i/24)"
+        sleep 5
+    done
+    if [[ $crowdsec_ready -eq 0 ]]; then
+        log "ERROR: CrowdSec did not become ready in time. Check 'docker logs crowdsec'."
+        return 1
+    fi
+
+    log "Generating CrowdSec bouncer API key..."
+    # A uno stage rilanciato il bouncer esiste già ("add" fallirebbe): lo si ricrea.
+    docker exec crowdsec cscli bouncers delete npm-bouncer > /dev/null 2>&1 || true
+    bouncer_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null)
+    if [[ -z "$bouncer_key" ]]; then
+        log "ERROR: Failed to generate bouncer key. Check 'docker logs crowdsec'."
+        return 1
+    fi
+    log "Bouncer key generated successfully"
+    set_env_var "$env_file" CROWDSEC_BOUNCER_API_KEY "$bouncer_key" || { log "ERROR: cannot write the key into $env_file"; return 1; }
+
+    log "Recreating cs-bouncer with the new API key..."
+    # "docker compose restart" non rilegge .env: il container terrebbe la vecchia chiave.
+    docker compose up -d --no-deps --force-recreate cs-bouncer || { log "ERROR: cannot recreate cs-bouncer"; return 1; }
+
+    # Prova che la chiave funziona: il forwardAuth risponde 200 per un IP non bannato
+    # (403 con una chiave non valida, nessuna risposta se il bouncer è giù).
+    code=000
+    for i in $(seq 1 12); do
+        code=$(docker exec npm curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: 127.0.0.1' \
+            "$CROWDSEC_FORWARD_AUTH_URL" 2>/dev/null)
+        [[ "$code" == "200" ]] && break
+        sleep 5
+    done
+    if [[ "$code" != "200" ]]; then
+        log "ERROR: cs-bouncer answers HTTP $code instead of 200. Check 'docker logs cs-bouncer' and 'docker exec crowdsec cscli bouncers list'."
+        return 1
+    fi
+    log "CrowdSec setup complete. Verify with: docker exec crowdsec cscli bouncers list"
+}
+
+# Attiva l'auth_request CrowdSec sui proxy host: scrive CROWDSEC_FORWARD_AUTH_URL nel .env ($1)
+# e rilancia npm-init, che scrive il blocco nginx globale. Da chiamare solo a bouncer verificato
+# (setup_crowdsec_bouncer): l'auth_request è fail-closed, con un bouncer che non risponde
+# i proxy host danno 403/500. Per questo l'URL non è già in example.env.
+enable_crowdsec_forward_auth()
+{
+    local env_file="$1" npm_init_exit
+
+    log "Enabling CrowdSec forward-auth on the NPM proxy hosts..."
+    set_env_var "$env_file" CROWDSEC_FORWARD_AUTH_URL "$CROWDSEC_FORWARD_AUTH_URL" || { log "ERROR: cannot write CROWDSEC_FORWARD_AUTH_URL into $env_file"; return 1; }
+    # npm-init è one-shot e "restart" non rilegge .env: lo si ricrea, così riparte con l'URL.
+    docker compose up -d --no-deps --force-recreate npm-init || { log "ERROR: cannot recreate npm-init"; return 1; }
+    npm_init_exit=$(docker wait npm-init)
+    if [[ "$npm_init_exit" != "0" ]]; then
+        log "ERROR: npm-init failed (exit $npm_init_exit). Check 'docker logs npm-init'."
+        return 1
+    fi
+    log "CrowdSec forward-auth enabled"
 }
 
 if [[ ! -d "$SETUP_DATA_FOLDER" ]]; then
@@ -162,14 +260,24 @@ elif [[ "$NEXT_STAGE" == "2" ]]; then
     sudo ufw default deny incoming
     sudo ufw default allow outgoing
     sudo ufw allow "$NEW_SSH_PORT"
+    # "systemctl enable" da solo non basta: /etc/ufw/ufw.conf parte con ENABLED=no e
+    # ufw-init non applica nessuna regola finché "ufw enable" non lo mette a yes.
+    # La porta SSH è già aperta sopra: la sessione in corso non cade.
+    sudo ufw --force enable
     sudo systemctl enable ufw
-    sudo systemctl reload ufw
 
 
     # Installing Docker
     log "Installing Docker"
     LINUX_DISTRO="$(hostnamectl | grep "Operating System" | cut -d':' -f2 | xargs | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-    sudo apt remove "$(dpkg --get-selections docker.io docker-compose docker-doc podman-docker containerd runc | cut -f1)" && sudo apt update
+    # Rimuove i pacchetti in conflitto, ma solo quelli installati: la lista deve essere
+    # un argomento per pacchetto (e non vuota), altrimenti apt fallisce; -y per non bloccare lo stage.
+    mapfile -t old_docker_pkgs < <(dpkg --get-selections docker.io docker-compose docker-doc podman-docker containerd runc 2> /dev/null | awk '$2 == "install" {print $1}')
+    if [[ ${#old_docker_pkgs[@]} -gt 0 ]]; then
+        log "Removing conflicting packages: ${old_docker_pkgs[*]}"
+        sudo apt remove -y "${old_docker_pkgs[@]}"
+    fi
+    sudo apt update
     sudo apt install -y ca-certificates curl
     sudo install -m 0755 -d /etc/apt/keyrings
     sudo curl -fsSL https://download.docker.com/linux/$LINUX_DISTRO/gpg -o /etc/apt/keyrings/docker.asc
@@ -202,24 +310,44 @@ elif [[ "$NEXT_STAGE" == "3" ]] ; then
     sudo systemctl disable apache2
 
     # Setup docker services
+    # NPM admin (81) e Open WebUI (3000) sono pubblicate solo su localhost: niente regole.
     sudo ufw allow "80"
     sudo ufw allow "443"
-    sudo ufw allow "81"
     sudo ufw allow "1195" # Personal VPN
-    sudo ufw allow "3000" # Open WebUI
-    cp -r services "/home/$NEW_USER"
     SERVICES_D="/home/$NEW_USER/services"
+    # Lo stage si può rilanciare dopo un errore: senza questo controllo "cp -r"
+    # annida la cartella (services/services) invece di riusare quella esistente.
+    if [[ -d "$SERVICES_D" ]]; then
+        log "$SERVICES_D già presente, la riuso (modifica lì il file .env, non l'originale)"
+    else
+        cp -r services "/home/$NEW_USER"
+    fi
     cd "$SERVICES_D" || exit 1
-    # shellcheck source=/dev/null
-    source "./.env"
+    # Il .env è il file di Compose (non sintassi shell): non va "sourced" da root, basta che esista.
+    if [[ ! -f .env ]]; then
+        log "ERROR: $SERVICES_D/.env not found. Copy example.env to .env, edit it and launch setup.sh again"
+        exit 1
+    fi
+    # Lo stage gira da root: la copia va intestata al nuovo utente (deve poter modificare
+    # .env e i file di configurazione) e il .env, con le credenziali, solo a lui.
+    chown -R "$NEW_USER:" "$SERVICES_D" || { log "ERROR: cannot change owner of $SERVICES_D"; exit 1; }
+    chmod 600 .env
     npm_db_password=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
     # Sostituisce il segnaposto sia nella forma di example.env (change_me_npm_db_password)
     # sia in quella nuda (npm_db_password); una password già scelta a mano resta intatta.
     sed -i "s/^NPM_DB_PASSWORD=\(change_me_\)\{0,1\}npm_db_password/NPM_DB_PASSWORD=$npm_db_password/" .env
 
     log "Activating services.."
-    docker compose up -d
-    
+    # proxynet è "external" nel compose: se non esiste "up" non avvia nulla.
+    if ! docker network inspect proxynet > /dev/null 2>&1; then
+        log "Creating docker network proxynet"
+        docker network create proxynet || { log "ERROR: cannot create docker network proxynet"; exit 1; }
+    fi
+    if ! docker compose up -d; then
+        log "ERROR: docker compose up failed. Fix the problem and launch setup.sh again (stage 3 can be repeated)"
+        exit 1
+    fi
+
     # Sleeping for 200 seconds
     SLEEP_AMOUNT_S=200
     SLEEP_INTERVAL_S=20
@@ -230,41 +358,14 @@ elif [[ "$NEXT_STAGE" == "3" ]] ; then
         fi
     done
 
-    # Generate CrowdSec bouncer API key and inject into .env
-    log "Waiting for CrowdSec to be ready..."
-    crowdsec_ready=0
-    for i in $(seq 1 24); do
-        if docker exec crowdsec cscli version > /dev/null 2>&1; then
-            crowdsec_ready=1
-            break
+    # Generate CrowdSec bouncer API key and inject into .env (solo se il profilo "server" è attivo)
+    if docker compose config --services | grep -qx crowdsec; then
+        if ! { setup_crowdsec_bouncer "$SERVICES_D/.env" && enable_crowdsec_forward_auth "$SERVICES_D/.env"; }; then
+            log "CrowdSec setup failed. Fix the problem and launch setup.sh again (stage 3 can be repeated)"
+            exit 1
         fi
-        log "CrowdSec not ready yet, retrying in 5s... ($i/24)"
-        sleep 5
-    done
-
-    if [[ $crowdsec_ready -eq 0 ]]; then
-        log "ERROR: CrowdSec did not become ready in time. Bouncer key NOT generated."
-        log "Run manually: docker exec crowdsec cscli bouncers add npm-bouncer"
-        log "Then update CROWDSEC_BOUNCER_API_KEY in $SERVICES_D/.env and restart cs-bouncer"
     else
-        log "Generating CrowdSec bouncer API key..."
-        crowdsec_bouncer_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null)
-
-        if [[ -z "$crowdsec_bouncer_key" ]]; then
-            log "ERROR: Failed to generate bouncer key. Check 'docker logs crowdsec'."
-        else
-            log "Bouncer key generated successfully"
-            # Write key into .env (replace placeholder if present, otherwise append)
-            if grep -q "^CROWDSEC_BOUNCER_API_KEY=" "$SERVICES_D/.env"; then
-                sed -i "s|^CROWDSEC_BOUNCER_API_KEY=.*|CROWDSEC_BOUNCER_API_KEY=$crowdsec_bouncer_key|" "$SERVICES_D/.env"
-            else
-                echo "CROWDSEC_BOUNCER_API_KEY=$crowdsec_bouncer_key" >> "$SERVICES_D/.env"
-            fi
-            log "Recreating cs-bouncer with the new API key..."
-            # "docker compose restart" non rilegge .env: il container terrebbe la vecchia chiave.
-            docker compose up -d --no-deps --force-recreate cs-bouncer
-            log "CrowdSec setup complete. Verify with: docker exec crowdsec cscli bouncers list"
-        fi
+        log "CrowdSec service not active (no 'server' profile): skipping bouncer key generation"
     fi
 
 
