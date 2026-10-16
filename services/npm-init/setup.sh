@@ -106,6 +106,14 @@ create_letsencrypt_certificate() {
             '.[] | select(.nice_name == $name or (.provider == "letsencrypt" and ((.domain_names | sort) == ($domains | sort)))) | .id' | head -1) || true
     [[ -n "$existing_id" ]] && { log "Cert LE '$name' già presente (ID: $existing_id)."; CERTIFICATE_ID="$existing_id"; return 0; }
 
+    # NPM accetta da solo i termini di servizio di Let's Encrypt quando richiede un certificato
+    # (certbot --agree-tos): il consenso del descriptor è l'unico modo di non darlo implicitamente.
+    local agree
+    agree=$(jq -r 'if .localCertificate.letsencrypt.agree == null then true else .localCertificate.letsencrypt.agree end' "$DESCRIPTOR")
+    if [[ "$agree" != "true" ]]; then
+        log "ERRORE: localCertificate.letsencrypt.agree non è true nel descriptor: NPM accetta i termini di servizio di Let's Encrypt in automatico, quindi senza il tuo consenso esplicito non richiedo il certificato."
+        return 1
+    fi
 
     log "Richiesta LE '$name' per: $(echo "$domains" | jq -r 'join(", ")' ) ..."
 
@@ -122,8 +130,11 @@ create_letsencrypt_certificate() {
     if [[ -n "$CERTIFICATE_ID" ]]; then
         log "Cert LE creato (ID: $CERTIFICATE_ID)."
     else
-        log "WARN: richiesta LE fallita: $resp — proseguo senza certificato."
+        # Senza certificato gli host andrebbero online in HTTP semplice (login di Portainer in chiaro):
+        # meglio fermarsi, ad esempio se il DNS non si è ancora propagato, e rilanciare.
+        log "ERRORE: richiesta LE fallita: $resp"
         CERTIFICATE_ID=0
+        return 1
     fi
 }
 
@@ -157,11 +168,16 @@ create_local_certificate() {
     cert_path="$tmp_dir/cert.pem"
     key_path="$tmp_dir/key.pem"
 
-    openssl req -x509 -nodes -newkey rsa:2048 \
+    if ! openssl req -x509 -nodes -newkey rsa:2048 \
         -days 365 \
         -subj "/CN=$(echo "$domains" | jq -r '.[0]')" \
         -addext "subjectAltName=$(echo "$domains" | jq -r 'map("DNS:" + .) | join(",")')" \
-        -keyout "$key_path" -out "$cert_path" >/dev/null 2>&1
+        -keyout "$key_path" -out "$cert_path" >/dev/null 2>&1; then
+        log "ERRORE: openssl non è riuscito a generare il certificato locale."
+        rm -rf "$tmp_dir"
+        CERTIFICATE_ID=0
+        return 1
+    fi
 
     # Step 1: crea il record certificato (provider "other").
     resp=$(jq -n --arg name "$name" --argjson domains "$domains" \
@@ -176,7 +192,7 @@ create_local_certificate() {
         log "ERRORE creazione cert locale: $resp"
         rm -rf "$tmp_dir"
         CERTIFICATE_ID=0
-        return 0
+        return 1
     fi
 
     # Step 2: carica i file cert/key sul record appena creato (endpoint dedicato).
@@ -191,6 +207,7 @@ create_local_certificate() {
     else
         log "ERRORE upload cert locale: $resp"
         CERTIFICATE_ID=0
+        return 1
     fi
 }
 
@@ -226,9 +243,9 @@ create_custom_certificate() {
 
     CERTIFICATE_ID=$(echo "$resp" | jq -r '.id // empty')
     if [[ -z "$CERTIFICATE_ID" ]]; then
-        log "WARN: creazione cert custom fallita: $resp — proseguo senza."
+        log "ERRORE: creazione cert custom fallita: $resp"
         CERTIFICATE_ID=0
-        return 0
+        return 1
     fi
 
     # Step 2: carica i file cert/key sul record appena creato (endpoint dedicato).
@@ -248,8 +265,9 @@ create_custom_certificate() {
     if echo "$resp" | jq -e '.certificate' &>/dev/null; then
         log "Cert custom caricato (ID: $CERTIFICATE_ID)."
     else
-        log "WARN: upload custom fallito: $resp — proseguo senza."
+        log "ERRORE: upload cert custom fallito: $resp"
         CERTIFICATE_ID=0
+        return 1
     fi
 }
 
@@ -270,6 +288,9 @@ SERVER_PROXY_CONF="$NPM_DATA_DIR/nginx/custom/server_proxy.conf"
 CROWDSEC_BEGIN="# --- CrowdSec bouncer (generato da npm-init) ---"
 CROWDSEC_END="# --- fine CrowdSec ---"
 SERVER_PROXY_CONF_CHANGED=0
+# copia del file prima di modificarlo, per poterlo ripristinare se nginx rifiuta la modifica
+SERVER_PROXY_CONF_BACKUP=""
+SERVER_PROXY_CONF_BACKED_UP=0
 
 # crowdsec_auth_snippet
 #   Stampa la config nginx che chiede al bouncer CrowdSec se l'IP del client è bannato.
@@ -279,11 +300,16 @@ SERVER_PROXY_CONF_CHANGED=0
 #     "host not found in upstream".
 #   - X-Forwarded-For viene sovrascritto con $remote_addr: il client non può
 #     spacciarsi per un altro IP.
+#   - le richieste /.well-known/acme-challenge/ sono sempre ammesse (vedi sotto).
 crowdsec_auth_snippet() {
     echo "$CROWDSEC_BEGIN"
     cat <<'EOF'
 location = /crowdsec-auth {
     internal;
+    # Le validazioni ACME HTTP-01 (rinnovo dei certificati Let's Encrypt) non passano dal bouncer:
+    # con il bouncer giù o la chiave non valida il rinnovo fallirebbe in silenzio. In una
+    # sottorichiesta $request_uri è l'URI della richiesta originale.
+    if ($request_uri ~ ^/\.well-known/acme-challenge/) { return 204; }
     resolver 127.0.0.11 valid=30s;
     set $crowdsec_forward_auth "@CROWDSEC_FORWARD_AUTH_URL@";
     proxy_pass $crowdsec_forward_auth;
@@ -295,6 +321,31 @@ location = /crowdsec-auth {
 auth_request /crowdsec-auth;
 EOF
     echo "$CROWDSEC_END"
+}
+
+# backup_server_proxy_conf / restore_server_proxy_conf
+#   Se nginx rifiuta il blocco appena scritto (o appena tolto) il file non può restare com'è:
+#   NPM ricontrolla la config a ogni salvataggio di un host, anche dalla UI, e al riavvio
+#   caricherebbe il file rifiutato. Si ripristina quindi il contenuto di prima (o si cancella il
+#   file, se prima non c'era).
+backup_server_proxy_conf() {
+    SERVER_PROXY_CONF_BACKUP=""
+    if [[ -f "$SERVER_PROXY_CONF" ]]; then
+        SERVER_PROXY_CONF_BACKUP=$(mktemp) || return 1
+        cp "$SERVER_PROXY_CONF" "$SERVER_PROXY_CONF_BACKUP" || return 1
+    fi
+    SERVER_PROXY_CONF_BACKED_UP=1
+}
+
+restore_server_proxy_conf() {
+    [[ "$SERVER_PROXY_CONF_BACKED_UP" == "1" ]] || return 0
+    if [[ -n "$SERVER_PROXY_CONF_BACKUP" ]]; then
+        cat "$SERVER_PROXY_CONF_BACKUP" > "$SERVER_PROXY_CONF"
+    else
+        rm -f "$SERVER_PROXY_CONF"
+    fi
+    log "Ripristinato $SERVER_PROXY_CONF com'era prima."
+    SERVER_PROXY_CONF_CHANGED=0
 }
 
 # apply_crowdsec_global_config
@@ -319,13 +370,16 @@ apply_crowdsec_global_config() {
         :   # già allineato
     elif [[ ! -s "$tmp" ]]; then
         if [[ -f "$SERVER_PROXY_CONF" ]]; then
+            backup_server_proxy_conf || { rm -f "$tmp"; return 1; }
             rm -f "$SERVER_PROXY_CONF" || { rm -f "$tmp"; return 1; }
             SERVER_PROXY_CONF_CHANGED=1
             log "Blocco CrowdSec rimosso da $SERVER_PROXY_CONF."
         fi
     else
+        backup_server_proxy_conf || { log "ERRORE: impossibile salvare una copia di $SERVER_PROXY_CONF"; rm -f "$tmp"; return 1; }
         if ! { mkdir -p "$(dirname "$SERVER_PROXY_CONF")" && cat "$tmp" > "$SERVER_PROXY_CONF"; }; then
             log "ERRORE: impossibile scrivere $SERVER_PROXY_CONF (volume npm_data montato in $NPM_DATA_DIR?)"
+            restore_server_proxy_conf
             rm -f "$tmp"
             return 1
         fi
@@ -344,7 +398,7 @@ create_proxy_host() {
 
     # Estrai tutti i campi
     local fwd_scheme fwd_host fwd_port ssl_forced hsts_enabled hsts_subdomains
-    local http2_support block_exploits caching_enabled ws_upgrade
+    local http2_support block_exploits caching_enabled ws_upgrade trust_forwarded_proto
     local access_list_id advanced_config enabled desc_cert_id locations
 
     fwd_scheme=$(echo "$host_json"  | jq -r '.forward_scheme')
@@ -358,6 +412,7 @@ create_proxy_host() {
     block_exploits=$(echo "$host_json"  | jq -r 'if .block_exploits == null then true else .block_exploits end')
     caching_enabled=$(echo "$host_json" | jq -r '.caching_enabled // false')
     ws_upgrade=$(echo "$host_json"      | jq -r '.allow_websocket_upgrade // false')
+    trust_forwarded_proto=$(echo "$host_json" | jq -r '.trust_forwarded_proto // false')
     access_list_id=$(echo "$host_json"  | jq -r '.access_list_id // 0')
     advanced_config=$(echo "$host_json" | jq -r '.advanced_config // ""')
     enabled=$(echo "$host_json"         | jq -r 'if .enabled == null then true else .enabled end')
@@ -392,6 +447,7 @@ create_proxy_host() {
         --argjson block_exploits "$block_exploits" \
         --argjson caching_enabled "$caching_enabled" \
         --argjson allow_websocket_upgrade "$ws_upgrade" \
+        --argjson trust_forwarded_proto "$trust_forwarded_proto" \
         --argjson access_list_id "$access_list_id" \
         --arg     advanced_config "$advanced_config" \
         --argjson certificate_id "$cert_id_to_use" \
@@ -400,7 +456,7 @@ create_proxy_host() {
         '{domain_names: $domain_names, forward_scheme: $forward_scheme, forward_host: $forward_host, forward_port: $forward_port,
           ssl_forced: $ssl_forced, hsts_enabled: $hsts_enabled, hsts_subdomains: $hsts_subdomains, http2_support: $http2_support,
           block_exploits: $block_exploits, caching_enabled: $caching_enabled, allow_websocket_upgrade: $allow_websocket_upgrade,
-          access_list_id: $access_list_id, advanced_config: $advanced_config, certificate_id: $certificate_id, enabled: $enabled,
+          trust_forwarded_proto: $trust_forwarded_proto, access_list_id: $access_list_id, advanced_config: $advanced_config, certificate_id: $certificate_id, enabled: $enabled,
           locations: $locations}')
 
     log "DEBUG payload proxy host: $(echo "$payload" | jq -c '.')"
@@ -467,7 +523,7 @@ main() {
 
     wait_for_npm || exit 1
     authenticate || exit 1
-    create_certificate
+    create_certificate || { log "ERRORE: certificato non disponibile: non creo i proxy host (andrebbero online senza HTTPS). Correggi il problema e rilancia npm-init."; exit 1; }
 
     local hosts_count i
     hosts_count=$(jq '.proxyHosts | length' "$DESCRIPTOR")
@@ -495,9 +551,16 @@ main() {
         if (( hosts_count > 0 )); then
             # NPM testa e ricarica nginx a ogni salvataggio di un host: si risalva il primo
             # (identico) perché il file appena cambiato venga verificato e caricato.
+            local first_host_json
+            first_host_json=$(jq -c '.proxyHosts[0]' "$DESCRIPTOR")
             log "Ricarico nginx per applicare la config globale..."
-            if ! create_proxy_host "$(jq -c '.proxyHosts[0]' "$DESCRIPTOR")" > /dev/null; then
+            if ! create_proxy_host "$first_host_json" > /dev/null; then
                 log "ERRORE: nginx rifiuta la config globale CrowdSec (vedi sopra)."
+                # NPM ha salvato l'host ma senza configurazione attiva (nginx_online=false): si
+                # toglie il file rifiutato e si risalva l'host perché NPM lo riattivi.
+                restore_server_proxy_conf
+                create_proxy_host "$first_host_json" > /dev/null \
+                    || log "ATTENZIONE: l'host non è tornato online: controllalo dalla UI di NPM."
                 exit 1
             fi
         else
@@ -505,6 +568,7 @@ main() {
         fi
     fi
 
+    [[ -n "$SERVER_PROXY_CONF_BACKUP" ]] && rm -f "$SERVER_PROXY_CONF_BACKUP"
     log "=== NPM Auto-Setup completato! ==="
 }
 
